@@ -208,55 +208,71 @@ The exit condition (Phase 5) says:
 
 **The failure mode**: The model calls `ExitPlanMode`, the user approves, but the model interprets the approval response as feedback and re-enters Phase 3 (review), asking "what do you want to change?" — creating an infinite loop.
 
-### Root Cause in Code
+### Root Cause in Code (5 Distinct Failure Mechanisms)
 
-`src/tools/ExitPlanModeTool/ExitPlanModeV2Tool.ts:357-403` — The `call()` method transitions mode via `setAppState`:
+**Mechanism 1 — SDK/Programmatic Use (Primary)** — [Issue #4251](https://github.com/anthropics/claude-code/issues/4251)
+
+When `ExitPlanMode` is approved, the SDK creates a synthetic `tool_result` user message saying "User has approved your plan" — but **never changes `permissionsMode` away from `plan`**. The `call()` method (lines 357-403) performs the state transition via `setAppState`, but `call()` only runs after `checkPermissions` returns `'allow'`. In SDK/programmatic contexts, the permission flow can create a synthetic approval message **without ever invoking `call()`**, so `mode` stays `'plan'`.
+
 ```typescript
+// ExitPlanModeV2Tool.ts:357 — This ONLY runs inside call()
 context.setAppState(prev => {
   if (prev.toolPermissionContext.mode !== 'plan') return prev
   setHasExitedPlanMode(true)
-  setNeedsPlanModeExitAttachment(true)
-  let restoreMode = prev.toolPermissionContext.prePlanMode ?? 'default'
-  // ... auto mode gate logic ...
-  return {
-    ...prev,
-    toolPermissionContext: {
-      ...baseContext,
-      mode: restoreMode,
-      prePlanMode: undefined,
-    },
-  }
+  // ... transition to restoreMode ...
 })
 ```
 
-The `mapToolResultToToolResultBlockParam()` (line 483-491) returns:
-```
-"User has approved your plan. You can now start coding."
-```
+The model then tries to execute, discovers it is still in plan mode (the `validateInput` check rejects calls when `mode !== 'plan'`), and calls `ExitPlanMode` again. Infinite loop.
 
-But the model sees this tool result alongside the still-injected plan mode instructions (from `getPlanModeV2Instructions()`), which tell it to stay in the 5-phase workflow. The `DANGEROUS_uncachedSystemPromptSection` for plan mode may not update fast enough, or the model weighs the workflow instructions more heavily than the tool result.
+**Mechanism 2 — CLI Race Condition** — [Issue #32923](https://github.com/anthropics/claude-code/issues/32923)
+
+After plan approval, a race condition in `setAppState` causes the plan approval state to not be properly cleared. Claude remains in plan mode and repeatedly asks "what do you want to change?" Workaround: press **SHIFT+TAB** while Claude is thinking. Related: #29064, #29110, #25173, #33039, #33209, #33702, #34066, #34181.
+
+**Mechanism 3 — Approval Misinterpretation** — [Issue #34111](https://github.com/anthropics/claude-code/issues/34111)
+
+The user's acceptance input is routed to the **rejection handler** instead of the acceptance handler. Claude says "the user denied the plan" and re-presents it.
+
+**Mechanism 4 — Don't-Ask Mode Deadlock** — [Issue #30463](https://github.com/anthropics/claude-code/issues/30463)
+
+In don't-ask mode (pre-approved permissions), `ExitPlanMode` **unconditionally presents an interactive approval UI**. This blocks the session forever since don't-ask mode is designed to never block on user input. The tool's `requiresUserInteraction()` returns `true` for non-teammate contexts regardless of permission mode.
+
+**Mechanism 5 — Configuration Trap** — [Issue #15874](https://github.com/anthropics/claude-code/issues/15874)
+
+Adding `EnterPlanMode`/`ExitPlanMode` to the `permissions.allow` array in `~/.claude/settings.local.json` triggers extra permission checks on every plan mode transition, creating a permission request loop. Fix: remove those entries.
 
 ### `validateInput` Guard (Partial Fix)
 
-Lines 195-219 add a guard: if mode is not `plan`, reject the tool call with:
-> "You are not in plan mode. This tool is only for exiting plan mode after writing a plan."
-
-But this only prevents *calling* ExitPlanMode outside plan mode. It doesn't prevent the model from re-entering the planning loop after a successful exit.
+Lines 195-219 add a guard: if mode is not `plan`, reject the tool call. But this only prevents *calling* ExitPlanMode outside plan mode — it doesn't prevent the model from re-entering the planning loop after a failed exit.
 
 ### Upstream Confirmed Issues
 
-| Issue | Title | Status | Version |
-|-------|-------|--------|---------|
-| [#15874](https://github.com/anthropics/claude-code/issues/15874) | ExitPlanMode Gets Stuck in Infinite Loop on Claude Desktop | Open | macOS, Dec 2025 |
-| [#32934](https://github.com/anthropics/claude-code/issues/32934) | ExitPlanMode fails when plan mode toggled via Shift+Tab after --dangerously-skip-permissions | Open | v2.1.72 |
-| [#33479](https://github.com/anthropics/claude-code/issues/33479) | Infinite Loop in Plan Acceptance Flow ("clear context and go on" option) | Open | v2.1.72 |
-| [#33702](https://github.com/anthropics/claude-code/issues/33702) | Plan mode loops infinitely when approving plan execution | **Closed** | v2.1.74 |
-| [#34066](https://github.com/anthropics/claude-code/issues/34066) | Plan mode incorrectly interprets approval as feedback | **Closed** | v2.1.74, Mar 2026 |
-| [#34111](https://github.com/anthropics/claude-code/issues/34111) | Accepting plan is interpreted as rejection, creating infinite loop | Open | Latest |
-| [#19623](https://github.com/anthropics/claude-code/issues/19623) | ExitPlanMode tool fails with "AbortError" — hangs indefinitely when MCP servers active | Open | - |
-| [#15755](https://github.com/anthropics/claude-code/issues/15755) | PermissionRequest: Allow does not exit plan mode for ExitPlanMode tool | Open | - |
+| Issue | Title | Status |
+|-------|-------|--------|
+| [#4251](https://github.com/anthropics/claude-code/issues/4251) | Cannot Exit Plan Mode in TypeScript SDK | Closed (dup of #2275, #3894, #5036, #5466) |
+| [#15755](https://github.com/anthropics/claude-code/issues/15755) | PermissionRequest Allow does not exit plan mode | Open |
+| [#15874](https://github.com/anthropics/claude-code/issues/15874) | ExitPlanMode Infinite Loop on Desktop | Closed (config issue) |
+| [#19623](https://github.com/anthropics/claude-code/issues/19623) | ExitPlanMode AbortError with MCP Servers | Open |
+| [#30463](https://github.com/anthropics/claude-code/issues/30463) | Plan mode blocks in don't-ask mode | Closed (stale) |
+| [#32923](https://github.com/anthropics/claude-code/issues/32923) | Plan mode not exiting after approval (race condition) | Open |
+| [#32934](https://github.com/anthropics/claude-code/issues/32934) | ExitPlanMode fails with Shift+Tab + --dangerously-skip-permissions | Open |
+| [#33479](https://github.com/anthropics/claude-code/issues/33479) | Infinite loop after "clear context and go on" | Open |
+| [#33702](https://github.com/anthropics/claude-code/issues/33702) | Plan mode loops infinitely when approving | Closed |
+| [#34066](https://github.com/anthropics/claude-code/issues/34066) | Approval incorrectly interpreted as feedback | Closed |
+| [#34111](https://github.com/anthropics/claude-code/issues/34111) | Acceptance interpreted as rejection | Open |
 
-The ClaUI project has a dedicated analysis file: [Yehonatan-Bar/ClaUI `BUG_EXITPLANMODE_INFINITE_LOOP.md`](https://github.com/Yehonatan-Bar/ClaUI/blob/main/Kingdom_of_Claudes_Beloved_MDs/BUG_EXITPLANMODE_INFINITE_LOOP.md)
+Related issues: #2275, #3894, #5036, #5466, #6495, #7320, #8956, #9701, #12288, #12753, #25173, #26930, #29064, #29110, #33039, #33209, #33225, #33491, #34181, #37225, #37446, #37560, #38491, #40017, #41758, #43576.
+
+**ClaUI Fix** (Most Detailed Community Fix): [Yehonatan-Bar/ClaUI `BUG_EXITPLANMODE_INFINITE_LOOP.md`](https://github.com/Yehonatan-Bar/ClaUI/blob/main/Kingdom_of_Claudes_Beloved_MDs/BUG_EXITPLANMODE_INFINITE_LOOP.md)
+
+ClaUI documented and fixed **17 interconnected bugs**. Key architectural fixes:
+1. **`MAX_EXITPLANMODE_REOPENS = 2`** — Hard reopen counter capping how many times the approval bar re-triggers
+2. **`exitPlanModeProcessed` master flag** — Prevents stale re-triggers after approval completes
+3. **`inAssistantTurn` boolean** — Replaced fragile lifecycle flags with real-time idle/busy indicator
+4. **`postExitPlanNonPlanActivityObserved`** — Distinguishes stale late events from fresh ExitPlanMode calls
+5. **Nudge text change** — Changed "Yes, proceed with the plan" to "Continue with the implementation" to avoid re-triggering planning behavior
+
+Root cause identified: "the CLI auto-approves ExitPlanMode and immediately starts the next turn. The messageStart handler cleared the approval bar before the user could see it" (~50ms auto-resume timing).
 
 ---
 
@@ -312,7 +328,15 @@ Remove the plan echo from the tool result (the model already has the plan in the
 
 **Recommended for OpenClaude**: Add to `src/query.ts` — track `planModeEnteredAt` timestamp. If `Date.now() - planModeEnteredAt > PLAN_MODE_TIMEOUT_MS`, inject a system message forcing transition.
 
-### 4.5 The Smaller-Model-Specific Problem
+### 4.5 User-Controlled Mode Boundary (Roo Code Pattern)
+
+**Repo**: [RooCodeInc/Roo-Code](https://github.com/RooCodeInc/Roo-Code) (Cline fork)
+
+Roo Code's Plan Mode / Act Mode split is intentionally designed so the **mode boundary is user-controlled** (not tool-controlled), completely avoiding the exit-condition-not-firing problem. The model never needs to call a tool to exit plan mode — the user toggles modes explicitly.
+
+This is architecturally the cleanest solution: remove the tool-based exit entirely for non-Claude models, and let the harness manage mode transitions.
+
+### 4.6 The Smaller-Model-Specific Problem
 
 For Kimi k2.5 / Qwen / local models, the loop is MORE likely because:
 1. They have weaker instruction-following, so the "you can now start coding" signal gets lost
