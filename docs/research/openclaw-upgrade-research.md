@@ -362,7 +362,28 @@ Persistent, searchable memory for Claude Code using:
 
 One-command setup (`npx claude-memory-init`). Adds context tracking, task management, and session handoff.
 
-**Recommended for OpenClaude**: claude-mem's hook-based architecture is the cleanest fit. It uses the same lifecycle hooks this codebase already supports (`src/schemas/hooks.ts`). Implement compressed memory injection as a `SessionStart` hook that loads relevant context based on current working directory.
+**AutoDream** (Unreleased — from the leak, gated behind feature flags)
+
+Anthropic's memory consolidation system runs between sessions, modeled on neuroscience synaptic homeostasis during sleep. 4-phase cycle:
+1. **Orient** — Read memory directory, survey existing topic files
+2. **Gather Signal** — Scan daily logs, grep session transcripts (JSONL), find user corrections/preference shifts
+3. **Consolidate** — Convert relative dates to absolute, merge duplicates, resolve contradictions in favor of most recent
+4. **Prune & Index** — Rebuild MEMORY.md as lean index under 200 lines; verbose entries demoted to dedicated topic files
+
+Trigger conditions: 24+ hours since last consolidation AND 5+ sessions minimum.
+
+**dream-skill** (Community Reimplementation of AutoDream)
+**Repo**: [grandamenium/dream-skill](https://github.com/grandamenium/dream-skill)
+
+Replicates AutoDream as a Claude Code skill:
+- `SKILL.md` — Core consolidation prompt with onboarding logic
+- `dream-hook.sh` — Stop hook that checks 24-hour timer on session exit (~10ms overhead)
+- Auto-detects memory paradigm (native Claude Code, OpenClaw-style, or project-root)
+- Invoke manually: `/dream` command
+
+**Native MEMORY.md constraints** (from the leak): MEMORY.md is capped at **200 lines** — anything beyond is not loaded at startup. It functions as an index, not a dump — links to topic-specific memory files with one-line descriptions.
+
+**Recommended for OpenClaude**: claude-mem's hook-based architecture is the cleanest fit. It uses the same lifecycle hooks this codebase already supports (`src/schemas/hooks.ts`). Implement compressed memory injection as a `SessionStart` hook that loads relevant context based on current working directory. Add dream-skill for inter-session consolidation.
 
 ### 5.2 Proactive Agent Loops (KAIROS Architecture)
 
@@ -376,6 +397,13 @@ KAIROS is Anthropic's unreleased always-on background agent, found in the leaked
 - Feature-gated via `feature('KAIROS')` and `feature('KAIROS_CHANNELS')` in this codebase
 
 This repo has the infrastructure: `src/utils/systemPrompt.ts:19-21` conditionally imports the proactive module, and `isProactiveActive_SAFE_TO_CALL_ANYWHERE()` gates the behavior.
+
+KAIROS implementation details (from the leak):
+- **Anti-narration principle**: If nothing useful to do, agent MUST call `SleepTool` rather than emitting status text (prevents terminal flooding)
+- **Terminal focus awareness**: `terminalFocus` parameter calibrates autonomy — more autonomous when user is away, defers when user returns
+- **15-second proactive action budget**: Strict time limit on any proactive action per tick
+- **Exclusive tools** (unavailable in normal mode): `PushNotification`, `SubscribePR`, `FileDelivery`
+- **Append-only daily logs** + AutoDream memory consolidation during idle periods
 
 **claude-corp** (Daemon-Based Agent Teams)
 **Repo**: [re-marked/claude-corp](https://github.com/re-marked/claude-corp)
@@ -444,6 +472,8 @@ Source: [swarmsignal.net — AI Agent Security 2026](https://swarmsignal.net/ai-
 2. Entry points: email attachments, PDFs, GitHub PR comments, diffs, linked issues
 3. Defense: infrastructure-level sandboxing, not just prompt-level instructions
 4. Tool call validation at system boundaries, not inside the model
+
+**ClawHavoc Incident** (Early 2026): Attackers planted hundreds of malicious typosquatted skills on ClawHub that exfiltrated SSH keys, API tokens, and browser session data. ClawHub removed 2,400+ suspicious skills and partnered with VirusTotal for automated scanning. Lesson: treat skill installation like dependency installation — audit before trust.
 
 ### 5.5 Skills Registries
 
@@ -554,19 +584,65 @@ Framework for serving and evaluating LLM routers. Routes requests based on compl
 - Uses trained classifier to predict which model tier is needed
 - Claims 2-4x cost reduction with <5% quality degradation on benchmarks
 
-### 6.4 ClawRouter (Agent-Native Routing)
+### 6.4 ClawRouter (Agent-Native Routing, <1ms)
 
 **Repo**: [BlockRunAI/ClawRouter](https://github.com/BlockRunAI/ClawRouter)
 
-Purpose-built for OpenClaw. Analyzes incoming requests and routes to appropriate model tier. Integrates with OpenClaw's agent system.
+Purpose-built for OpenClaw. Routes requests across **15 dimensions** entirely locally in under 1ms.
 
-### 6.5 Agent Router
+| Tier | ECO | AUTO | PREMIUM |
+|------|-----|------|---------|
+| SIMPLE | nvidia/gpt-oss-120b (FREE) | gemini-2.5-flash ($0.30) | kimi-k2.5 |
+| MEDIUM | gemini-3.1-flash-lite ($0.25) | kimi-k2.5 ($0.60) | gpt-5.3-codex ($1.75) |
+| COMPLEX | gemini-3.1-flash-lite ($0.25) | gemini-3.1-pro ($2) | claude-opus-4.6 ($5) |
+| REASONING | grok-4-1-fast ($0.20) | grok-4-1-fast-reasoning ($0.20) | claude-sonnet-4.6 ($3) |
+
+**Blended cost**: $2.05/M tokens vs $25/M for Claude Opus alone (92% savings in AUTO mode).
+
+Integration (OpenAI-compatible proxy on port 8402):
+```bash
+npx @blockrun/clawrouter
+# Then point OpenAI client at http://localhost:8402 with model "blockrun/auto"
+```
+
+### 6.5 NVIDIA LLM Router v2
+
+**Repo**: [NVIDIA-AI-Blueprints/llm-router](https://github.com/NVIDIA-AI-Blueprints/llm-router)
+
+Two routing strategies:
+- **Intent-based**: Qwen 1.7B classifies requests into categories ("hard_question", "chit_chat", "image_understanding"), maps to models
+- **Auto-routing**: CLIP embeddings + neural network predicts optimal model from quality/latency/cost metrics
+
+Routes between: gpt-5-chat (complex reasoning), nemotron-nano-12b-v2-vl (vision), nvidia-nemotron-nano-9b-v2 (simple text).
+
+### 6.6 Agent Router
 
 **Site**: [agentrouter.dev](https://agentrouter.dev/)
 
 Smart LLM routing for Cline and OpenHands. Multi-provider request routing with cost optimization.
 
-### 6.6 Recommended Architecture for OpenClaude
+### 6.7 openclaw-agents (9-Agent Adversarial Orchestration)
+
+**Repo**: [shenhao-stu/openclaw-agents](https://github.com/shenhao-stu/openclaw-agents)
+
+One-command deployment of 9 specialized subagents with adversarial collaboration:
+
+| Agent | Role |
+|-------|------|
+| Main | System coordinator, audit, arbitration |
+| Planner | Task decomposition, coordination |
+| Ideator | Idea generation, novelty |
+| Critic | Quality evaluation, taste gates (SHARP >= 18 threshold) |
+| Coder | Implementation, experiments |
+| Writer | Content authoring |
+| Reviewer | Internal peer review |
+
+**Adversarial pairs**: Ideator vs Critic, Writer vs Reviewer. Per-agent model customization:
+```bash
+./setup.sh --model-map '{"planner":"claude-opus-4","coder":"gpt-5.3-codex","critic":"kimi-k2.5"}'
+```
+
+### 6.8 Recommended Architecture for OpenClaude
 
 Given this codebase's existing `smart_router.py` and the OpenAI shim, the cleanest architecture:
 
@@ -627,6 +703,11 @@ Implementation path:
 | yogesharc/babyclaw | - | Single-file Agent SDK alternative | github.com/yogesharc/babyclaw |
 | qwibitai/nanoclaw | - | Container-based lightweight claw | github.com/qwibitai/nanoclaw |
 | SuperClaude-Org/SuperClaude_Framework | - | Token compression research | github.com/SuperClaude-Org/SuperClaude_Framework |
+| grandamenium/dream-skill | - | AutoDream reimplementation | github.com/grandamenium/dream-skill |
+| NVIDIA-AI-Blueprints/llm-router | - | Intent-based model routing | github.com/NVIDIA-AI-Blueprints/llm-router |
+| ulab-uiuc/LLMRouter | - | 16+ routing algorithms | github.com/ulab-uiuc/LLMRouter |
+| shenhao-stu/openclaw-agents | - | 9-agent adversarial orchestration | github.com/shenhao-stu/openclaw-agents |
+| abhi1693/openclaw-mission-control | - | Agent governance platform | github.com/abhi1693/openclaw-mission-control |
 
 ### Key Community Discussions (Hacker News)
 
