@@ -63,13 +63,33 @@ The harness was designed assuming the model is Claude. Every other model drowns.
 
 ## 2. Token Bloat — Community Solutions
 
-### 2.1 Deferred Tool Loading (Claude's Own Pattern)
+### Quantifying the Problem
+
+Every Claude Code API call re-sends the full system prompt (~14,328 tokens) plus all tool definitions (12-17K tokens) plus all MCP server tool definitions. A typical multi-server setup consumes ~55K tokens in definitions before any user work begins. By turn 30, the conversation can reach 167K tokens before compaction fires.
+
+Key reference: [Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts) — tracks 110+ distinct prompt strings across 141 Claude Code versions (as of v2.1.92). This is the definitive source for understanding exactly what gets injected per turn.
+
+### 2.1 Deferred Tool Loading (Claude's Own `defer_loading` Pattern)
 
 This codebase already has the mechanism — `shouldDefer: true` on tool definitions (see `ExitPlanModeV2Tool.ts:167`). Deferred tools register their name only; full schemas are fetched on demand via `ToolSearch`. Anthropic's own fix reduced MCP context bloat by 46.9% (51K to 8.5K tokens).
 
-**Pattern**: Only inject tool names + 1-line descriptions. Load full schemas when the model calls `ToolSearch`.
+Anthropic's API-level implementation uses `defer_loading: true` on tool definitions:
+```json
+{
+  "name": "get_weather",
+  "description": "Get current weather for a location",
+  "input_schema": { ... },
+  "defer_loading": true
+}
+```
+- Deferred tools are NOT included in the system-prompt prefix
+- When the model discovers a deferred tool through search, the definition is appended inline as a `tool_reference` block
+- The prefix is untouched, so **prompt caching is preserved**
+- Returns 3-5 most relevant tools per search (85%+ reduction)
+- Supports up to 10,000 tools in the catalog
+- **Limitation**: Sonnet 4.0+ and Opus 4.0+ only — no Haiku, no open-source models. Must be replicated in harness code for smaller models.
 
-Source: Claude Code docs, [Medium: Claude Code Cut MCP Context Bloat by 46.9%](https://medium.com/@joe.njenga/claude-code-just-cut-mcp-context-bloat-by-46-9-51k-tokens-down-to-8-5k-with-new-tool-search-ddf9e905f734)
+Source: [Claude API Docs — Tool Search Tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool), [Medium: 46.9% reduction](https://medium.com/@joe.njenga/claude-code-just-cut-mcp-context-bloat-by-46-9-51k-tokens-down-to-8-5k-with-new-tool-search-ddf9e905f734)
 
 ### 2.2 Trigger-Based Routing (54% Reduction)
 
@@ -132,7 +152,36 @@ Claude Code skill for maintaining workspace files. Key constraints the community
 - **~150,000 character total** across all bootstrap files
 - **Recommended target: 10,000-15,000 chars per file** for best results
 
-### 2.10 Recommended Implementation for OpenClaude
+### 2.10 Clean-Room Harness Rewrites (Token-Optimized from Scratch)
+
+**learn-claude-code ("Bash is All You Need")**
+**Repo**: [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)
+
+Nano agent harness built from scratch in 12 progressive sessions. Directly addresses injection:
+- **Session 5**: On-demand skill loading (NOT upfront injection)
+- **Session 6**: Three-layer context compression
+- Core loop: `while True: call LLM -> check stop_reason -> execute tools -> append results -> loop`
+
+**Clawd-Code (Python reconstruction)**
+**Repo**: [GPT-AGI/Clawd-Code](https://github.com/GPT-AGI/Clawd-Code)
+
+Python reimplementation with multi-provider support (Anthropic, OpenAI, Zhipu GLM). Key patterns:
+- Modular skill loading via `.clawd/skills/` with SKILL.md files
+- `allowed-tools` in YAML frontmatter prevents unnecessary tool definitions in context
+- Project context loads on-demand rather than in base system prompt
+
+**nanobot** (99% smaller than OpenClaw)
+**Repo**: [HKUDS/nanobot](https://github.com/HKUDS/nanobot)
+
+4,000 lines of Python. Prompt caching support, token-based memory system, stream delta coalescing. Decoupled provider/channel/agent architecture reduces prompt duplication.
+
+### 2.11 Key Architectural Insight
+
+> "The harness matters more than the model." — SWE-Bench Pro shows a 22+ point swing between basic and optimized scaffolds using the same model. That gap dwarfs the difference between any two frontier models.
+
+The SuperClaude Framework (Issue [#286](https://github.com/SuperClaude-Org/SuperClaude_Framework/issues/286)) documented reducing an ~8000 token framework to ~3200 tokens (60% reduction) and found a critical caveat: **compressed symbolic formats sometimes consume MORE tokens than natural language** due to tokenization. The 2.2:1 token-to-word ratio means word-count compression doesn't map linearly to token savings. Always measure actual token counts, not character counts.
+
+### 2.12 Recommended Implementation for OpenClaude
 
 For models like Kimi k2.5, the combination that makes sense:
 
@@ -574,6 +623,19 @@ Implementation path:
 | zhijiewong/openharness | - | Open-source agent harness framework | github.com/zhijiewong/openharness |
 | HKUDS/nanobot | - | Ultra-lightweight OpenClaw alternative | github.com/HKUDS/nanobot |
 | Yehonatan-Bar/ClaUI | - | ExitPlanMode bug analysis | github.com/Yehonatan-Bar/ClaUI |
+| instructkr/claw-code | 100K+ | Rust+Python clean-room rewrite | github.com/instructkr/claw-code |
+| yogesharc/babyclaw | - | Single-file Agent SDK alternative | github.com/yogesharc/babyclaw |
+| qwibitai/nanoclaw | - | Container-based lightweight claw | github.com/qwibitai/nanoclaw |
+| SuperClaude-Org/SuperClaude_Framework | - | Token compression research | github.com/SuperClaude-Org/SuperClaude_Framework |
+
+### Key Community Discussions (Hacker News)
+
+| Thread | URL |
+|--------|-----|
+| "Claude's system prompt is over 24k tokens with tools" | news.ycombinator.com/item?id=43909409 |
+| "I solved Claude Code's prompt injection problem, saved tokens" (~90% reduction, 24,700 -> 575) | news.ycombinator.com/item?id=47167134 |
+| "Compress Your Claude.md: Cut 60-70% of System Prompt Bloat" | news.ycombinator.com/item?id=47144537 |
+| "The Claude Code Source Leak: fake tools, frustration regexes, undercover mode" | news.ycombinator.com/item?id=47586778 |
 
 ---
 
